@@ -1,6 +1,6 @@
-##Лабораторные работы по курсу Системное программное обеспечение / Операционные системы##
+##Лабораторные работы по курсу Системное программное обеспечение / Операционные системы
 
-#EN#
+#EN
 1) Laboratory Work №1 “Operating System Characteristics”
 Develop a program that monitors the state of CPU load, RAM, and file system. The program should generate graphs. Additionally, the program should display computer information: processor architecture, number of processors, processor type, computer name, username, and device information. Use the following functions for implementation: WinAPI POSIX, GetSystemTimes, GlobalMemoryStatus, GlobalMemoryStatusEx, GetSystemInfo, GetDiskFreeSpace.  
 
