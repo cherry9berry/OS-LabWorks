@@ -26,7 +26,7 @@ class VFSManager:
         Start interactive mode for command input.
         """
         self.is_running = True
-        print("Virtual File System. Type QUIT to exit.")
+        print("Virtual File System.")
         
         while self.is_running:
             command_str = input(self.get_prompt()).strip()
