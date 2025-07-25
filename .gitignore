@@ -4,7 +4,6 @@ build/
 dist/
 test/
 tests/
-lab4/
 *.py[cod]
 *$py.class
 test/
