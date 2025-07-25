@@ -11,7 +11,7 @@ from config import (PIPE_NAME, PIPE_BUFFER_SIZE, MAX_CLIENTS, PIPE_READ_BUFFER_S
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
