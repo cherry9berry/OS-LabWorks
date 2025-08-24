@@ -2,6 +2,8 @@ import time
 import threading
 import random
 import csv
+import ctypes
+from ctypes import wintypes
 
 
 # Константы 
@@ -13,6 +15,79 @@ FIB_N = 35
 HOLD_LOCK_MS = 300  # задержка лока, мс
 ENABLE_THREAD_SAFETY = True  # False — отключает локи (для демонстрации гонок)
 
+# WinAPI (ctypes)
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+WAIT_OBJECT_0 = 0x00000000
+INFINITE = 0xFFFFFFFF
+
+
+class WinMutex:
+    def __init__(self):
+        self.handle = kernel32.CreateMutexW(None, False, None)
+
+    def acquire(self, timeout_ms=None) -> bool:
+        ms = INFINITE if (timeout_ms is None) else int(timeout_ms)
+        res = kernel32.WaitForSingleObject(self.handle, ms)
+        return res == WAIT_OBJECT_0
+
+    def release(self) -> None:
+        kernel32.ReleaseMutex(self.handle)
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+class WinSemaphore:
+    def __init__(self, initial: int = 0, maximum: int = 0x7fffffff):
+        self.handle = kernel32.CreateSemaphoreW(None, initial, maximum, None)
+
+    def acquire(self, timeout_s: float | None = None) -> bool:
+        ms = INFINITE if (timeout_s is None) else int(timeout_s * 1000)
+        res = kernel32.WaitForSingleObject(self.handle, ms)
+        return res == WAIT_OBJECT_0
+
+    def release(self, count: int = 1) -> None:
+        kernel32.ReleaseSemaphore(self.handle, count, None)
+
+
+class WinEvent:
+    def __init__(self, manual_reset: bool = False, initial_state: bool = False):
+        self.handle = kernel32.CreateEventW(None, bool(manual_reset), bool(initial_state), None)
+
+    def set(self) -> None:
+        kernel32.SetEvent(self.handle)
+
+    def reset(self) -> None:
+        kernel32.ResetEvent(self.handle)
+
+    def wait(self, timeout_s: float | None = None) -> bool:
+        ms = INFINITE if (timeout_s is None) else int(timeout_s * 1000)
+        res = kernel32.WaitForSingleObject(self.handle, ms)
+        return res == WAIT_OBJECT_0
+
+    def is_set(self) -> bool:
+        return self.wait(0)
+
+
+class WinBarrier:
+    """Одноразовый барьер на WinAPI (manual-reset event)."""
+    def __init__(self, parties: int):
+        self.parties = parties
+        self.count = 0
+        self.lock = WinMutex()
+        self.evt = WinEvent(manual_reset=True, initial_state=False)
+
+    def wait(self):
+        with self.lock:
+            self.count += 1
+            if self.count >= self.parties:
+                self.evt.set()
+        self.evt.wait()
+
 
 class _NullLock:
     def __enter__(self):
@@ -23,14 +98,14 @@ class _NullLock:
 class BarberShop:
     def __init__(self, csv_path: str):
         self.queue = []
-        self.state_lock = threading.Lock() if ENABLE_THREAD_SAFETY else _NullLock()
-        self.customers = threading.Semaphore(0)
-        self.stop = threading.Event()
+        self.state_lock = WinMutex() if ENABLE_THREAD_SAFETY else _NullLock()
+        self.customers = WinSemaphore(0)
+        self.stop = WinEvent()
         self.arrived = 0
         self.served = 0
         self.lost = 0
         self.barber_thr = None
-        self.log_lock = threading.Lock()
+        self.log_lock = WinMutex()
         self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         self.csv = csv.writer(self.csv_file)
         self.csv.writerow(["ts", "perf_ns", "thread", "client", "event", "q_len", "free"])
@@ -58,7 +133,7 @@ class BarberShop:
     def start_barber(self):
         def loop():
             while not self.stop.is_set():
-                if not self.customers.acquire(timeout=0.1):
+                if not self.customers.acquire(timeout_s=0.1):
                     continue
                 with self.state_lock:
                     if HOLD_LOCK_MS > 0:
@@ -79,18 +154,15 @@ class BarberShop:
         self.barber_thr = threading.Thread(target=loop, name="Barber", daemon=True)
         self.barber_thr.start()
 
-    def spawn_client(self, cid: int, barrier: threading.Barrier):
+    def spawn_client(self, cid: int, barrier: WinBarrier):
         def run():
-            try:
-                barrier.wait()
-            except threading.BrokenBarrierError:
-                pass
+            barrier.wait()
             with self.state_lock:
                 self.arrived += 1
                 ql = len(self.queue)
                 fr = CHAIRS - ql
             self._log("arrive", cid, q_len=ql, free=fr)
-            token = {'id': cid, 'ev': threading.Event()}
+            token = {'id': cid, 'ev': WinEvent()}
             with self.state_lock:
                 if HOLD_LOCK_MS > 0:
                     time.sleep(HOLD_LOCK_MS / 1000.0)
@@ -120,10 +192,7 @@ class BarberShop:
 
     def shutdown(self):
         self.stop.set()
-        try:
-            self.customers.release()
-        except ValueError:
-            pass
+        self.customers.release()
         if self.barber_thr:
             self.barber_thr.join(timeout=5)
         with self.log_lock:
@@ -154,14 +223,11 @@ def run_burst():
     csv_path = ts_name
     shop = BarberShop(csv_path)
     shop.start_barber()
-    barrier = threading.Barrier(BURST_SIZE + 1)
+    barrier = WinBarrier(BURST_SIZE + 1)
     threads = [shop.spawn_client(i + 1, barrier) for i in range(BURST_SIZE)]
     start_t = None
-    try:
-        barrier.wait()
-        start_t = time.perf_counter()
-    except threading.BrokenBarrierError:
-        pass
+    barrier.wait()
+    start_t = time.perf_counter()
     for t in threads:
         t.join()
     time.sleep(0.2)
