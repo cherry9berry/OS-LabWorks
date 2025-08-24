@@ -4,6 +4,7 @@ import platform
 import os
 import ctypes
 from ctypes import wintypes
+import winreg
 from collections import deque
 
 
@@ -65,6 +66,9 @@ class SystemInfo(ttk.Frame):
 
         rows = [
             ("OS", info["os"]),
+            ("Computer", info["computer_name"]),
+            ("User", info["user_name"]),
+            ("CPU model", info["cpu_model"]),
             ("Architecture", info["arch"]),
             ("Logical cores", str(info["cores_logical"])),
             ("RAM total (GB)", f"{info['ram_total_gb']:.2f}"),
@@ -105,6 +109,7 @@ class SystemInfo(ttk.Frame):
                 ('wProcessorRevision', wintypes.WORD),
             ]
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
         ms = MEMORYSTATUSEX()
         ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
         kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
@@ -114,11 +119,35 @@ class SystemInfo(ttk.Frame):
         cores = int(si.dwNumberOfProcessors)
         arch_map = {0: 'x86', 5: 'ARM', 6: 'IA64', 9: 'x64', 12: 'ARM64'}
         arch = arch_map.get(si.wProcessorArchitecture, platform.machine())
+        # Имя компьютера
+        comp_buf = ctypes.create_unicode_buffer(256)
+        comp_sz = wintypes.DWORD(len(comp_buf))
+        if not kernel32.GetComputerNameW(comp_buf, ctypes.byref(comp_sz)):
+            comp_name = ""
+        else:
+            comp_name = comp_buf.value
+        # Имя пользователя
+        user_buf = ctypes.create_unicode_buffer(256)
+        user_sz = wintypes.DWORD(len(user_buf))
+        if not advapi32.GetUserNameW(user_buf, ctypes.byref(user_sz)):
+            user_name = ""
+        else:
+            user_name = user_buf.value
+        # Модель процессора из реестра
+        cpu_model = ""
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0") as k:
+                cpu_model, _ = winreg.QueryValueEx(k, "ProcessorNameString")
+        except Exception:
+            cpu_model = ""
         return {
             "os": f"{platform.system()} {platform.release()}",
             "arch": arch,
             "cores_logical": cores,
             "ram_total_gb": total_gb,
+            "computer_name": comp_name,
+            "user_name": user_name,
+            "cpu_model": cpu_model,
         }
 
 
