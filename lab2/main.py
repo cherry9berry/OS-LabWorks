@@ -3,7 +3,6 @@ from tkinter import ttk
 import ctypes
 from ctypes import wintypes
 import logging
-import psutil
 
 
 # Настройка логирования (краткие русские сообщения)
@@ -31,6 +30,9 @@ PROCESS_VM_READ = 0x0010
 PROCESS_TERMINATE = 0x0001
 PROCESS_SET_INFORMATION = 0x0200
 CREATE_NEW_CONSOLE = 0x00000010
+TH32CS_SNAPPROCESS = 0x00000002
+TH32CS_SNAPTHREAD = 0x00000004
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 
@@ -66,6 +68,31 @@ class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
         ('PeakPagefileUsage', ctypes.c_size_t),
     ]
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+        ('th32ModuleID', wintypes.DWORD),
+        ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD),
+        ('pcPriClassBase', wintypes.LONG),
+        ('dwFlags', wintypes.DWORD),
+        ('szExeFile', ctypes.c_wchar * 260),
+    ]
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ThreadID', wintypes.DWORD),
+        ('th32OwnerProcessID', wintypes.DWORD),
+        ('tpBasePri', wintypes.LONG),
+        ('tpDeltaPri', wintypes.LONG),
+        ('dwFlags', wintypes.DWORD),
+    ]
+
 
 
 # Функции
@@ -83,45 +110,62 @@ def get_process_memory(pid):
     return "Н/Д"
 
 def get_thread_handles(pid):
-    """Открытие потоков процесса с правами приостановки/возобновления."""
-    try:
-        proc = psutil.Process(pid)
-        threads = proc.threads()
-        if not threads:
-            return []
-        thread_handles = []
-        for thread in threads:
-            thread_handle = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, thread.id)
-            if thread_handle:
-                thread_handles.append(thread_handle)
-        return thread_handles
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    """Открытие потоков процесса с правами приостановки/возобновления (Toolhelp)."""
+    h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if h_snapshot == INVALID_HANDLE_VALUE:
         return []
+    te = THREADENTRY32()
+    te.dwSize = ctypes.sizeof(THREADENTRY32)
+    handles = []
+    ok = kernel32.Thread32First(h_snapshot, ctypes.byref(te))
+    while ok:
+        if te.th32OwnerProcessID == pid:
+            h = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, te.th32ThreadID)
+            if h:
+                handles.append(h)
+        ok = kernel32.Thread32Next(h_snapshot, ctypes.byref(te))
+    kernel32.CloseHandle(h_snapshot)
+    return handles
 
 def get_thread_count(pid):
-    try:
-        proc = psutil.Process(pid)
-        return len(proc.threads())
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    """Количество потоков процесса (через снимок потоков)."""
+    h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if h_snapshot == INVALID_HANDLE_VALUE:
         return 0
+    te = THREADENTRY32()
+    te.dwSize = ctypes.sizeof(THREADENTRY32)
+    count = 0
+    ok = kernel32.Thread32First(h_snapshot, ctypes.byref(te))
+    while ok:
+        if te.th32OwnerProcessID == pid:
+            count += 1
+        ok = kernel32.Thread32Next(h_snapshot, ctypes.byref(te))
+    kernel32.CloseHandle(h_snapshot)
+    return count
 
 def get_process_tree():
+    """Снимок процессов через Toolhelp, дерево по PPID."""
+    h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     process_dict = {}
-    # Простой опрос всех PID
-    for pid in psutil.pids():
-        try:
-            p = psutil.Process(pid)
-            process_dict[pid] = {
-                'name': p.name(),
-                'pid': pid,
-                'ppid': p.ppid() or 0,
-                'children': [],
-                'status': "Running"
-            }
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    # Строим дерево
     tree = {}
+    if h_snapshot == INVALID_HANDLE_VALUE:
+        return tree, process_dict
+    pe = PROCESSENTRY32W()
+    pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    ok = kernel32.Process32FirstW(h_snapshot, ctypes.byref(pe))
+    while ok:
+        pid = pe.th32ProcessID
+        ppid = pe.th32ParentProcessID
+        name = pe.szExeFile
+        process_dict[pid] = {
+            'name': name,
+            'pid': pid,
+            'ppid': ppid,
+            'children': [],
+            'status': "Running"
+        }
+        ok = kernel32.Process32NextW(h_snapshot, ctypes.byref(pe))
+    kernel32.CloseHandle(h_snapshot)
     for pid, info in process_dict.items():
         ppid = info['ppid']
         if ppid in process_dict:
@@ -252,27 +296,30 @@ class ProcessManagerApp(tk.Tk):
             return
         pid = int(self.process_tree.item(selected_item, "values")[0])
         try:
-            proc = psutil.Process(pid)
-            children = proc.children(recursive=True)
-            for ch in children:
-                try:
-                    h = kernel32.OpenProcess(PROCESS_TERMINATE, False, ch.pid)
-                    if h:
-                        kernel32.TerminateProcess(h, 1)
-                        kernel32.CloseHandle(h)
-                except Exception:
-                    pass
+            # Построить дерево и собрать всех потомков
+            tree, proc_map = get_process_tree()
+            to_kill = []
+            def collect_descendants(p):
+                for child in proc_map.get(p, {}).get('children', []):
+                    to_kill.append(child)
+                    collect_descendants(child)
+            collect_descendants(pid)
+            # Сначала дети
+            for child_pid in to_kill:
+                h = kernel32.OpenProcess(PROCESS_TERMINATE, False, child_pid)
+                if h:
+                    kernel32.TerminateProcess(h, 1)
+                    kernel32.CloseHandle(h)
+            # Затем сам процесс
             h_parent = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
             if h_parent:
                 kernel32.TerminateProcess(h_parent, 1)
                 kernel32.CloseHandle(h_parent)
             else:
                 logger.error("Не удалось открыть процесс")
-            for ch in children:
-                self.thread_status.pop(ch.pid, None)
+            for child_pid in to_kill:
+                self.thread_status.pop(child_pid, None)
             self.thread_status.pop(pid, None)
-        except psutil.NoSuchProcess:
-            logger.error("Процесс больше не существует")
         except Exception as e:
             logger.error(f"Не удалось завершить дерево: {e}")
 
@@ -335,8 +382,6 @@ class ProcessManagerApp(tk.Tk):
 
             for handle in thread_handles:
                 kernel32.CloseHandle(handle)
-        except psutil.NoSuchProcess:
-            logger.error("Процесс больше не существует")
         except Exception as e:
             logger.error(f"Не удалось приостановить/возобновить потоки: {e}")
 
